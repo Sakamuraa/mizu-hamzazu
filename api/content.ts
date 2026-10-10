@@ -680,8 +680,29 @@ async function readClips(): Promise<ContentItem[]> {
  * which is exactly the failure a stale copy can paper over.
  */
 let lastGood: { payload: unknown; at: number; liveCount: number; upcoming: boolean } | null = null;
-const MEMORY_TTL_LIVE_MS = 10 * 60 * 1000;
-const MEMORY_TTL_QUIET_MS = 30 * 60 * 1000;
+/*
+ * These three were ten minutes while live and thirty while quiet, chosen from the
+ * state the payload is already in.
+ *
+ * That is backwards, and it is the reason a stream could take half an hour to
+ * appear. The state a payload is in is exactly the thing about to change: while
+ * the channel sits quiet, `lastGood` says "no live stream" and is held for thirty
+ * minutes, so the request that would have noticed a stream starting is the one
+ * the memory layer does not make. A visitor gets a warm instance that skips
+ * YouTube for half an hour and returns an answer that stopped being true minutes
+ * ago. It fails in both directions -- quiet holds "not live" too long, and live
+ * holds "live" for ten minutes after a stream ends.
+ *
+ * So the window is set by how soon this payload can *cease* to be true, and that
+ * is the same for every state: live status is pressed by a human, not a timer,
+ * so any payload can be out of date at any moment. Thirty seconds while live is
+ * the one place a shorter window is worth it, because that is the state a
+ * visitor is actively watching. Quiet gets a minute, which is generous for a
+ * channel with nothing scheduled but still bounded. The upcoming branch is
+ * unchanged and was always the right shape.
+ */
+const MEMORY_TTL_LIVE_MS = 30 * 1000;
+const MEMORY_TTL_QUIET_MS = 60 * 1000;
 /**
  * Scheduled but not started.
  *
@@ -696,21 +717,24 @@ const MEMORY_TTL_UPCOMING_MS = 20 * 1000;
 /**
  * Edge window for a channel with nothing running.
  *
- * Fifteen minutes, not the hour this used to carry.
+ * Sixty seconds, and `stale-while-revalidate` at the same size as the fresh
+ * window rather than a multiple of it.
  *
- * The edge entry was the binding constraint on how fast a new upload could
- * appear, not the memory layer above it: the warm copy refreshes after half an
- * hour, but an hour-long edge entry means the edge never asks until well after
- * that, so the effective freshness was sixty minutes on a quiet channel rather
- * than the thirty the memory layer was written for.
+ * This used to be fifteen minutes with a half-hour stale window behind it, which
+ * meant that even after the memory layer was fixed, a stream that started during
+ * a quiet stretch stayed invisible to the edge for a quarter of an hour. The
+ * edge entry is the binding constraint -- while it is fresh the function is never
+ * invoked, so however short the memory layer is, a long edge window simply wins.
  *
- * Lowering it costs nothing against YouTube. The memory layer still absorbs the
- * upstream call; this only means the edge consults that layer twice as often and
- * gets its answer without leaving Vercel. The age labels no longer depend on this
- * window either -- those are measured from `publishedAt` on the client -- so this
- * governs when a new upload appears, not how old the cards claim to be.
+ * The stale multiplier was the quieter half of the problem: `stale-while-
+ * revalidate=1800` lets an expired copy keep being served for half an hour while
+ * a refresh happens behind it, which is why the live flag in production could sit
+ * on a stale answer for minutes after the function had already re-checked.
+ * Keeping swr equal to s-maxage bounds the whole thing -- a response is at most
+ * about two minutes old -- and hands the refresh back to the next request instead
+ * of to a background job nobody is watching.
  */
-const QUIET_CACHE = "public, s-maxage=900, stale-while-revalidate=1800";
+const QUIET_CACHE = "public, s-maxage=60, stale-while-revalidate=60";
 
 
 export default async function handler(req: UploadsRequest, res: UploadsResponse) {
@@ -720,9 +744,16 @@ export default async function handler(req: UploadsRequest, res: UploadsResponse)
     return;
   }
 
-  // Warm instance, fresh enough: answer without touching YouTube at all. While a
-  // stream is running that window is ten minutes, because that is the state a
-  // visitor is watching change. Once it ends, half an hour is safe.
+  /*
+   * Warm instance, fresh enough: answer without touching YouTube at all.
+   *
+   * The window per state is above; the header set here is deliberately the same
+   * shape for every branch. The live branch used to be five minutes with a ten
+   * minute stale window behind it -- longer than the quiet channel's -- which is
+   * inverted: live is the one state a visitor is watching for a change, so it is
+   * the one that should expire soonest. Upcoming keeps twenty seconds, which is
+   * already the shortest.
+   */
   if (lastGood) {
     const ttl = lastGood.upcoming
       ? MEMORY_TTL_UPCOMING_MS
@@ -734,9 +765,9 @@ export default async function handler(req: UploadsRequest, res: UploadsResponse)
       res.setHeader(
         "Cache-Control",
         lastGood.upcoming
-          ? "public, s-maxage=20, stale-while-revalidate=45"
+          ? "public, s-maxage=20, stale-while-revalidate=20"
           : lastGood.liveCount > 0
-            ? "public, s-maxage=300, stale-while-revalidate=600"
+            ? "public, s-maxage=30, stale-while-revalidate=30"
             : QUIET_CACHE,
       );
       res.setHeader("X-Data-Source", "memory");
@@ -760,13 +791,18 @@ export default async function handler(req: UploadsRequest, res: UploadsResponse)
   if (streams.length === 0 && videos.length === 0 && clips.length === 0) {
     // Everything failed. A stale copy is still true data and beats an error
     // page, as long as the caller is told it is stale.
+    //
+    // The stale window matches the fresh one here too. It used to be ten minutes
+    // behind a thirty-second window, which meant a recovery could take that long
+    // to reach the edge -- the copy that most needs replacing was the one held
+    // longest.
     if (lastGood) {
-      res.setHeader("Cache-Control", "public, s-maxage=30, stale-while-revalidate=600");
+      res.setHeader("Cache-Control", "public, s-maxage=30, stale-while-revalidate=30");
       res.setHeader("X-Data-Source", "stale");
       res.status(200).json({ ...(lastGood.payload as object), stale: true });
       return;
     }
-    res.setHeader("Cache-Control", "public, s-maxage=30, stale-while-revalidate=300");
+    res.setHeader("Cache-Control", "public, s-maxage=30, stale-while-revalidate=30");
     res.status(503).json({ error: "could not read any source" });
     return;
   }
@@ -794,14 +830,27 @@ export default async function handler(req: UploadsRequest, res: UploadsResponse)
 
   lastGood = { payload, at: Date.now(), liveCount, upcoming: upcoming !== null };
 
-  // A finished archive does not change for hours, so a quiet channel gets a long
-  // edge window. Once something is running the cache drops to five minutes.
+  /*
+   * This is the path a cold fetch takes, and the one that decides what a visitor
+   * sees first, so the edge windows here are the ones that matter.
+   *
+   * Both tiers used to be longer than the state justifies. A live stream got
+   * five minutes plus a ten-minute stale window, and a quiet channel got fifteen
+   * plus thirty -- so the two answers a visitor could receive were, respectively,
+   * current for five minutes and stale for as long as half an hour. Now: live is
+   * thirty seconds, upcoming twenty, quiet a minute, and each one's stale window
+   * matches its fresh window rather than doubling it.
+   *
+   * The comment above used to claim a finished archive "does not change for
+   * hours". That is true of the video list and not of live status, and live status
+   * is the part a visitor opens the page to see.
+   */
   res.setHeader(
     "Cache-Control",
     upcoming
-      ? "public, s-maxage=20, stale-while-revalidate=45"
+      ? "public, s-maxage=20, stale-while-revalidate=20"
       : liveCount > 0
-        ? "public, s-maxage=300, stale-while-revalidate=600"
+        ? "public, s-maxage=30, stale-while-revalidate=30"
         : QUIET_CACHE,
   );
   res.setHeader("X-Data-Source", "live");
